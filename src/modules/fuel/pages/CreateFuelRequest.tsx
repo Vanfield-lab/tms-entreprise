@@ -25,33 +25,29 @@ export default function CreateFuelRequest() {
 
       const [{ data: v }, { data: d }] = await Promise.all([
         supabase.from("vehicles").select("id,plate_number,make,model").eq("status", "active").order("plate_number"),
-        supabase.from("drivers").select("id,license_number,user_id").eq("employment_status", "active"),
-      ]);
+        supabase
+          .from("v_drivers_with_names")
+          .select("id,license_number,user_id,full_name")
+          .eq("employment_status", "active")
+              ]);
 
       setVehicles((v as Vehicle[]) || []);
 
       // Enrich drivers with names
       const rows = (d as any[]) || [];
-      const userIds = rows.map(r => r.user_id).filter(Boolean);
-      let nameMap: Record<string, string> = {};
-      if (userIds.length > 0) {
-        const { data: profiles } = await supabase
-          .from("profiles")
-          .select("user_id,full_name")
-          .in("user_id", userIds);
-        nameMap = Object.fromEntries(((profiles as any[]) || []).map(p => [p.user_id, p.full_name]));
-      }
-      setDrivers(rows.map(r => ({
-        id: r.id,
-        license_number: r.license_number,
-        full_name: r.user_id ? (nameMap[r.user_id] ?? r.license_number) : r.license_number,
-      })));
 
-      // Auto-select current driver if user is a driver
-      if (me.user) {
-        const myDriver = rows.find(r => r.user_id === me.user!.id);
-        if (myDriver) setDriverId(myDriver.id);
-      }
+setDrivers(
+  rows.map((r) => ({
+    id: r.id,
+    license_number: r.license_number,
+    full_name: r.full_name ?? r.license_number,
+  }))
+);
+        // Auto-select current driver if user is a driver
+        if (me.user) {
+          const myDriver = rows.find((r) => r.user_id === me.user!.id);
+          if (myDriver) setDriverId(myDriver.id);
+        }
     })();
   }, []);
 
@@ -128,7 +124,7 @@ export default function CreateFuelRequest() {
           <div>
             <label className="form-label">Vehicle</label>
             <select className="tms-select" value={vehicleId} onChange={e => setVehicleId(e.target.value)}>
-              <option value="">— Select vehicle (optional) —</option>
+              <option value=""> Select vehicle </option>
               {vehicles.map(v => (
                 <option key={v.id} value={v.id}>
                   {v.plate_number}{v.make ? ` · ${v.make}${v.model ? " " + v.model : ""}` : ""}
@@ -141,10 +137,10 @@ export default function CreateFuelRequest() {
           <div>
             <label className="form-label">Driver</label>
             <select className="tms-select" value={driverId} onChange={e => setDriverId(e.target.value)}>
-              <option value="">— Select driver (optional) —</option>
-              {drivers.map(d => (
-                <option key={d.id} value={d.id}>{d.full_name} · {d.license_number}</option>
-              ))}
+              <option value=""> Select driver </option>
+            {drivers.map(d => (
+              <option key={d.id} value={d.id}>{d.full_name}</option>
+            ))}
             </select>
           </div>
 
