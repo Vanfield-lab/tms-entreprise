@@ -248,6 +248,13 @@ export default function AdminUserManagement() {
   const [rejectingId,  setRejectingId]  = useState<string | null>(null);
   const [togglingId,   setTogglingId]   = useState<string | null>(null);
 
+  // Reset password
+  const [resetProfile, setResetProfile] = useState<Profile | null>(null);
+  const [resetPwd,     setResetPwd]     = useState("");
+  const [resetSaving,  setResetSaving]  = useState(false);
+  const [resetError,   setResetError]   = useState("");
+  const [resetSuccess, setResetSuccess] = useState("");
+
   const load = async () => {
     const [{ data: d }, { data: u }, { data: r }, profs] = await Promise.all([
       supabase.from("divisions").select("id,name").order("name"),
@@ -323,12 +330,19 @@ export default function AdminUserManagement() {
 
   // ── Toggle active / inactive ─────────────────────────────────────────────
   const toggleStatus = async (p: Profile) => {
-    setTogglingId(p.user_id);
-    try {
-      await setUserStatus(p.user_id, p.status === "active" ? "inactive" : "active");
-      await load();
-    } finally { setTogglingId(null); }
-  };
+  setTogglingId(p.user_id);
+
+  try {
+    const nextStatus = p.status === "active" ? "disabled" : "active";
+    await setUserStatus(p.user_id, nextStatus);
+    await load();
+  } catch (e: any) {
+    alert(e.message ?? "Failed to update user status.");
+    console.error("toggleStatus failed:", e);
+  } finally {
+    setTogglingId(null);
+  }
+};
 
   // ── Edit user ────────────────────────────────────────────────────────────
   const openEdit = (p: Profile) => {
@@ -369,11 +383,39 @@ export default function AdminUserManagement() {
     if (!deletingProfile) return;
     setDeleteActing(true);
     try {
-      await setUserStatus(deletingProfile.user_id, "inactive");
+      await setUserStatus(deletingProfile.user_id, "disabled");
       await supabase.from("profiles").delete().eq("user_id", deletingProfile.user_id);
       setDeletingProfile(null);
       await load();
     } finally { setDeleteActing(false); }
+  };
+
+  // ── Reset password ────────────────────────────────────────────────────────────
+  // supabase.auth.admin requires the service-role key — NOT available in browser.
+  // Route through the reset-password Edge Function which uses SUPABASE_SERVICE_ROLE_KEY.
+  const handleResetPassword = async () => {
+    if (!resetProfile || !resetPwd.trim()) { setResetError("New password is required."); return; }
+    if (resetPwd.trim().length < 8) { setResetError("Password must be at least 8 characters."); return; }
+    setResetSaving(true); setResetError("");
+    setResetSuccess("");
+    try {
+      // Explicitly attach the session token — required for Edge Function auth
+      const { data: { session } } = await supabase.auth.getSession();
+      if (!session) throw new Error("Not authenticated.");
+      const res = await supabase.functions.invoke("reset-password", {
+        body: { target_user_id: resetProfile.user_id, new_password: resetPwd.trim() },
+        headers: { Authorization: `Bearer ${session.access_token}` },
+      });
+      if (res.error) throw new Error(res.error.message);
+      if (res.data?.error) throw new Error(res.data.error);
+      setResetSuccess(`Password reset successfully for ${resetProfile.full_name}.`);
+          setResetPwd("");
+          setTimeout(() => {
+            setResetProfile(null);
+            setResetSuccess("");
+          }, 1800);
+    } catch (e: any) { setResetError(e.message ?? "Failed to reset password."); }
+    finally { setResetSaving(false); }
   };
 
   const filteredProfiles = profiles.filter(p =>
@@ -598,6 +640,15 @@ export default function AdminUserManagement() {
                           onClick: () => toggleStatus(p),
                         },
                         {
+                          label: "Reset Password", icon: "🔑",
+                          onClick: () => {
+                            setResetProfile(p);
+                            setResetPwd("");
+                            setResetError("");
+                            setResetSuccess("");
+                          },
+                        },
+                        {
                           label: "Delete", icon: "🗑️", cls: "danger",
                           onClick: () => setDeletingProfile(p),
                         },
@@ -621,18 +672,37 @@ export default function AdminUserManagement() {
                           <td><Badge status={p.system_role} /></td>
                           <td className="text-[color:var(--text-muted)]">{p.position_title ?? "—"}</td>
                           <td><Badge status={p.status} /></td>
-                          <td>
-                            <div className="flex gap-2">
-                              <Btn variant="ghost" size="sm" onClick={() => openEdit(p)}>Edit</Btn>
-                              <Btn
-                                variant={p.status === "active" ? "amber" : "success"}
-                                size="sm"
-                                loading={togglingId === p.user_id}
-                                onClick={() => toggleStatus(p)}
-                              >
-                                {p.status === "active" ? "Deactivate" : "Activate"}
-                              </Btn>
-                              <Btn variant="danger" size="sm" onClick={() => setDeletingProfile(p)}>Delete</Btn>
+                          <td className="text-center" >
+                            <div className="flex justify-center">
+                            <CtxMenu items={[
+                              {
+                                label: "Edit",
+                                icon: "✏️",
+                                onClick: () => openEdit(p),
+                              },
+                              {
+                                label: p.status === "active" ? "Deactivate" : "Activate",
+                                icon: p.status === "active" ? "🔒" : "✅",
+                                cls: p.status === "active" ? "warning" : "success",
+                                onClick: () => toggleStatus(p),
+                              },
+                              {
+                                label: "Reset Password",
+                                icon: "🔑",
+                                onClick: () => {
+                                  setResetProfile(p);
+                                  setResetPwd("");
+                                  setResetError("");
+                                  setResetSuccess("");
+                                },
+                              },
+                              {
+                                label: "Delete",
+                                icon: "🗑️",
+                                cls: "danger",
+                                onClick: () => setDeletingProfile(p),
+                              },
+                            ]} />
                             </div>
                           </td>
                         </tr>
@@ -696,6 +766,36 @@ export default function AdminUserManagement() {
           </div>
         </div>
       </Modal>
+
+      {/* ── Reset Password Modal ────────────────────────────────────────── */}
+      {resetProfile && (
+        <div className="fixed inset-0 z-[60] flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm">
+          <div className="bg-[color:var(--surface)] border border-[color:var(--border)] rounded-2xl p-6 w-full max-w-sm shadow-2xl">
+            <h3 className="text-base font-semibold text-[color:var(--text)] mb-1">Reset Password</h3>
+            <p className="text-sm text-[color:var(--text-muted)] mb-4">
+              Set a new password for <strong>{resetProfile.full_name}</strong>.
+            </p>
+            <Field label="New Password" required>
+              <Input
+                type="password"
+                value={resetPwd}
+                onChange={e => setResetPwd(e.target.value)}
+                placeholder="Min. 8 characters"
+              />
+            </Field>
+            {resetError && <p className="text-sm mt-2" style={{ color: "var(--red)" }}>{resetError}</p>}
+            {resetSuccess && (
+              <p className="text-sm mt-2" style={{ color: "var(--green)" }}>
+                {resetSuccess}
+              </p>
+            )}
+            <div className="flex justify-end gap-3 mt-5">
+              <Btn variant="ghost" onClick={() => setResetProfile(null)}>Cancel</Btn>
+              <Btn variant="primary" loading={resetSaving} onClick={handleResetPassword}>Reset Password</Btn>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* ── Delete Confirm ───────────────────────────────────────────────── */}
       <ConfirmDialog

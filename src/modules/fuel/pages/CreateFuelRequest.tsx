@@ -56,41 +56,58 @@ export default function CreateFuelRequest() {
   }, []);
 
   const submit = async () => {
-    if (!purpose.trim()) { setError("Purpose is required."); return; }
-    setSaving(true); setError(null);
-    try {
-      // Insert draft directly — no fuel_type, liters, estimated_cost
-      const { data: draft, error: insertErr } = await supabase
-        .from("fuel_requests")
-        .insert({
-          vehicle_id: vehicleId || null,
-          driver_id:  driverId  || null,
-          purpose:    purpose.trim(),
-          notes:      notes.trim() || null,
-          status:     "draft",
-        })
-        .select("id")
-        .single();
+  if (!purpose.trim()) {
+    setError("Purpose is required.");
+    return;
+  }
 
-      if (insertErr) throw insertErr;
+  setSaving(true);
+  setError(null);
 
-      // Submit via RPC
-      const { error: submitErr } = await supabase.rpc("submit_fuel_request", {
-        p_fuel_request_id: (draft as any).id,
-        p_meta: {},
-      });
-      if (submitErr) throw submitErr;
+  try {
+    const {
+      data: { user },
+    } = await supabase.auth.getUser();
 
-      setVehicleId(""); setDriverId(""); setPurpose(""); setNotes("");
-      setSuccess(true);
-      setTimeout(() => setSuccess(false), 5000);
-    } catch (e: any) {
-      setError(e.message ?? "Submission failed.");
-    } finally {
-      setSaving(false);
+    if (!user) {
+      throw new Error("You must be signed in to create a fuel request.");
     }
-  };
 
+    const { data: draft, error: insertErr } = await supabase
+      .from("fuel_requests")
+      .insert({
+        created_by: user.id,
+        vehicle_id: vehicleId || null,
+        driver_id: driverId || null,
+        request_date: new Date().toISOString().slice(0, 10),
+        purpose: purpose.trim(),
+        notes: notes.trim() || null,
+        status: "draft",
+      })
+      .select("id")
+      .single();
+
+    if (insertErr) throw insertErr;
+
+    const { error: submitErr } = await supabase.rpc("submit_fuel_request", {
+      p_fuel_request_id: (draft as any).id,
+      p_meta: {},
+    });
+
+    if (submitErr) throw submitErr;
+
+    setVehicleId("");
+    setDriverId("");
+    setPurpose("");
+    setNotes("");
+    setSuccess(true);
+    setTimeout(() => setSuccess(false), 5000);
+  } catch (e: any) {
+    setError(e.message ?? "Submission failed.");
+  } finally {
+    setSaving(false);
+  }
+};
   return (
     <div className="max-w-lg space-y-4">
       {success && (

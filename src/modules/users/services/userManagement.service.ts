@@ -56,10 +56,18 @@ export async function listProfiles() {
 /**
  * Deactivate / reactivate a user profile.
  */
-export async function setUserStatus(userId: string, status: "active" | "inactive"): Promise<void> {
-  const { error } = await supabase
+export async function setUserStatus(userId: string, status: "active" | "disabled") {
+  const { data, error } = await supabase
     .from("profiles")
     .update({ status })
-    .eq("user_id", userId);
+    .eq("user_id", userId)
+    .select("user_id, status");
+
   if (error) throw error;
+
+  if (!data || data.length === 0) {
+    throw new Error("No user profile was updated. Check RLS or the user ID.");
+  }
+
+  return data[0];
 }
