@@ -23,8 +23,8 @@ function isElementItem(item: NavItem): item is ElementNavItem {
 // ─── Role helpers ─────────────────────────────────────────────────────────────
 const ROLE_LABELS: Record<string, string> = {
   admin:                "Administrator",
-  corporate_approver:   "Corporate",
-  transport_supervisor: "Transport",
+  corporate_approver:   "Corporate Resource Manager",
+  transport_supervisor: "Transport Supervisor",
   driver:               "Driver",
   unit_head:            "Unit Head",
   staff:                "Staff",

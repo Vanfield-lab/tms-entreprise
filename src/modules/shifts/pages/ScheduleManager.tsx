@@ -1,7 +1,7 @@
-// src/modules/shifts/pages/ScheduleManager.tsx
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { supabase } from "@/lib/supabase";
 
+// ── Types ─────────────────────────────────────────────────────
 type CalRow = {
   driver_id: string;
   driver_name: string;
@@ -11,9 +11,11 @@ type CalRow = {
   shift_date: string;
   shift_code: "morning" | "evening" | "off";
   cell_label: string;
-  department_name: "Joy News" | "Adom News" | "Joy Business" | "Production" | null;
-  is_override: boolean;
+  department_name: string | null; // kept from current SQL view, but treated as generic deployment label
   block_start_date: string | null;
+  evening_route_name: string | null;
+  evening_route_id: string | null;
+  is_override: boolean;
 };
 
 type Driver = {
@@ -22,6 +24,11 @@ type Driver = {
   license: string;
   team_id: string | null;
   team_name: string | null;
+};
+
+type EveningRoute = {
+  id: string;
+  name: string;
 };
 
 type GenerateResult = {
@@ -40,6 +47,15 @@ type OverrideModal = {
   current: "morning" | "evening" | "off";
 } | null;
 
+type RouteModal = {
+  driver_id: string;
+  driver_name: string;
+  shift_date: string;
+  current_route_id: string | null;
+  current_route_name: string | null;
+} | null;
+
+// ── Design tokens ─────────────────────────────────────────────
 const SHIFT_CODES = ["morning", "evening", "off"] as const;
 
 const SHIFT_STYLE: Record<
@@ -69,14 +85,20 @@ const SHIFT_STYLE: Record<
   },
 };
 
-const DEPT_COLORS: Record<
-  "Joy News" | "Adom News" | "Joy Business" | "Production",
-  { bg: string; text: string }
-> = {
+// These are common labels you already use.
+// Unknown units/divisions will still render nicely using fallback styling.
+const DEPLOYMENT_COLORS: Record<string, { bg: string; text: string }> = {
   "Joy News": { bg: "var(--accent-dim)", text: "var(--accent)" },
   "Adom News": { bg: "var(--amber-dim)", text: "var(--amber)" },
   "Joy Business": { bg: "var(--green-dim)", text: "var(--green)" },
-  "Production": { bg: "var(--purple-dim)", text: "var(--purple)" },
+  Production: { bg: "var(--purple-dim)", text: "var(--purple)" },
+};
+
+const DEPLOYMENT_SORT_ORDER: Record<string, number> = {
+  "Joy News": 1,
+  "Adom News": 2,
+  "Joy Business": 3,
+  Production: 4,
 };
 
 function fmt(d: Date): string {
@@ -93,35 +115,56 @@ function getWeekDates(anchor: Date): Date[] {
   });
 }
 
+function getDeploymentColors(name: string | null) {
+  if (!name) return null;
+  return (
+    DEPLOYMENT_COLORS[name] ?? {
+      bg: "var(--surface-2)",
+      text: "var(--text)",
+    }
+  );
+}
+
+function getMorningDisplayLabel(row: CalRow): string {
+  return row.department_name ?? "Morning";
+}
+
+function getEveningDisplayLabel(row: CalRow): string {
+  return row.evening_route_name ?? "Evening";
+}
+
+function getCellDisplayLabel(row: CalRow): string {
+  if (row.shift_code === "off") return "Off";
+  if (row.shift_code === "morning") return getMorningDisplayLabel(row);
+  return getEveningDisplayLabel(row);
+}
+
+// ── Cells ─────────────────────────────────────────────────────
 function ShiftCell({
-  shift_code,
-  department_name,
-  is_override,
+  row,
   onClick,
 }: {
-  shift_code: "morning" | "evening" | "off";
-  department_name: CalRow["department_name"];
-  is_override: boolean;
+  row: CalRow;
   onClick: () => void;
 }) {
-  const shift = SHIFT_STYLE[shift_code];
-  const deptColor =
-    shift_code === "morning" && department_name
-      ? DEPT_COLORS[department_name]
-      : null;
+  const shift = SHIFT_STYLE[row.shift_code];
+  const deploymentColor =
+    row.shift_code === "morning" ? getDeploymentColors(row.department_name) : null;
+
+  const displayLabel = getCellDisplayLabel(row);
 
   return (
     <button
       onClick={onClick}
-      title={`${shift.label}${department_name ? ` · ${department_name}` : ""}${
-        is_override ? " (override)" : ""
+      title={`${shift.label}${displayLabel ? ` · ${displayLabel}` : ""}${
+        row.is_override ? " (override)" : ""
       }`}
       style={{
         width: "100%",
-        minHeight: 48,
+        minHeight: 50,
         padding: "4px 3px",
-        background: deptColor ? deptColor.bg : shift.bg,
-        border: `1px solid ${deptColor ? deptColor.text : shift.border}`,
+        background: deploymentColor ? deploymentColor.bg : shift.bg,
+        border: `1px solid ${deploymentColor ? deploymentColor.text : shift.border}`,
         borderRadius: 8,
         cursor: "pointer",
         position: "relative",
@@ -133,6 +176,7 @@ function ShiftCell({
       }}
     >
       <span style={{ fontSize: 15, lineHeight: 1 }}>{shift.icon}</span>
+
       <span
         style={{
           fontSize: 9,
@@ -140,14 +184,16 @@ function ShiftCell({
           textTransform: "uppercase",
           letterSpacing: "0.04em",
           lineHeight: 1.2,
-          color: deptColor ? deptColor.text : shift.text,
+          color: deploymentColor ? deploymentColor.text : shift.text,
           textAlign: "center",
+          maxWidth: "100%",
+          wordBreak: "break-word",
         }}
       >
-        {shift_code === "off" ? "Off" : department_name ?? shift.label}
+        {displayLabel}
       </span>
 
-      {is_override && (
+      {row.is_override && (
         <span
           style={{
             position: "absolute",
@@ -171,7 +217,7 @@ function EmptyCell({ onClick }: { onClick: () => void }) {
       onClick={onClick}
       style={{
         width: "100%",
-        minHeight: 48,
+        minHeight: 50,
         background: "none",
         border: "1px dashed var(--border)",
         borderRadius: 8,
@@ -185,14 +231,17 @@ function EmptyCell({ onClick }: { onClick: () => void }) {
   );
 }
 
+// ── Main ──────────────────────────────────────────────────────
 export default function ScheduleManager() {
   const [rows, setRows] = useState<CalRow[]>([]);
+  const [routes, setRoutes] = useState<EveningRoute[]>([]);
   const [loading, setLoading] = useState(true);
   const [anchor, setAnchor] = useState(new Date());
   const [teamFilter, setTeamFilter] = useState("all");
   const [teams, setTeams] = useState<{ id: string; name: string }[]>([]);
   const [error, setError] = useState<string | null>(null);
 
+  // Generate modal
   const [showGen, setShowGen] = useState(false);
   const [genStart, setGenStart] = useState(fmt(new Date()));
   const [genEnd, setGenEnd] = useState(() => {
@@ -204,16 +253,24 @@ export default function ScheduleManager() {
   const [genSaving, setGenSaving] = useState(false);
   const [genResult, setGenResult] = useState<string | null>(null);
 
+  // Shift override modal
   const [overrideModal, setOverrideModal] = useState<OverrideModal>(null);
   const [overrideCode, setOverrideCode] = useState<"morning" | "evening" | "off">("morning");
   const [overrideReason, setOverrideReason] = useState("");
   const [overrideSaving, setOverrideSaving] = useState(false);
+
+  // Route override modal
+  const [routeModal, setRouteModal] = useState<RouteModal>(null);
+  const [selectedRouteId, setSelectedRouteId] = useState<string>("");
+  const [routeReason, setRouteReason] = useState("");
+  const [routeSaving, setRouteSaving] = useState(false);
 
   const weekDates = useMemo(() => getWeekDates(anchor), [anchor]);
   const weekStart = fmt(weekDates[0]);
   const weekEnd = fmt(weekDates[6]);
   const today = fmt(new Date());
 
+  // ── Loaders ───────────────────────────────────────────────
   const load = useCallback(async () => {
     setLoading(true);
     setError(null);
@@ -224,7 +281,6 @@ export default function ScheduleManager() {
       .gte("shift_date", weekStart)
       .lte("shift_date", weekEnd)
       .order("team_name", { ascending: true })
-      .order("driver_name", { ascending: true })
       .order("shift_date", { ascending: true });
 
     if (err) {
@@ -239,15 +295,13 @@ export default function ScheduleManager() {
 
     setRows(calRows);
 
-    const teamMap = new Map<string, string>();
+    const tMap = new Map<string, string>();
     calRows.forEach((r) => {
-      if (r.team_id && r.team_name) {
-        teamMap.set(r.team_id, r.team_name);
-      }
+      if (r.team_id && r.team_name) tMap.set(r.team_id, r.team_name);
     });
 
     setTeams(
-      [...teamMap.entries()]
+      [...tMap.entries()]
         .map(([id, name]) => ({ id, name }))
         .sort((a, b) => a.name.localeCompare(b.name))
     );
@@ -255,10 +309,23 @@ export default function ScheduleManager() {
     setLoading(false);
   }, [weekStart, weekEnd]);
 
+  const loadRoutes = useCallback(async () => {
+    const { data, error } = await supabase
+      .from("evening_routes")
+      .select("id, name")
+      .order("name", { ascending: true });
+
+    if (!error) {
+      setRoutes(Array.isArray(data) ? (data as EveningRoute[]) : []);
+    }
+  }, []);
+
   useEffect(() => {
     void load();
-  }, [load]);
+    void loadRoutes();
+  }, [load, loadRoutes]);
 
+  // ── Grid ───────────────────────────────────────────────────
   const grid = useMemo(() => {
     const g: Record<string, Record<string, CalRow>> = {};
     rows.forEach((r) => {
@@ -288,6 +355,30 @@ export default function ScheduleManager() {
     );
   }, [rows, teamFilter]);
 
+  // ── Sorting helpers ───────────────────────────────────────
+  function getDriverWeekPriority(driverId: string): { bucket: number; label: string } {
+    for (const d of weekDates) {
+      const row = grid[driverId]?.[fmt(d)];
+      if (!row) continue;
+
+      if (row.shift_code === "morning") {
+        return {
+          bucket: DEPLOYMENT_SORT_ORDER[row.department_name ?? ""] ?? 20,
+          label: row.department_name ?? "Morning",
+        };
+      }
+
+      if (row.shift_code === "evening") {
+        return {
+          bucket: 50,
+          label: row.evening_route_name ?? "Evening",
+        };
+      }
+    }
+
+    return { bucket: 99, label: "Off" };
+  }
+
   const { byTeam, noTeam } = useMemo(() => {
     const grouped = new Map<string, { name: string; drivers: Driver[] }>();
     const unassigned: Driver[] = [];
@@ -303,49 +394,23 @@ export default function ScheduleManager() {
       }
     });
 
-    return { byTeam: grouped, noTeam: unassigned };
-  }, [allDrivers]);
+    for (const [, group] of grouped.entries()) {
+      group.drivers.sort((a, b) => {
+        const pa = getDriverWeekPriority(a.id);
+        const pb = getDriverWeekPriority(b.id);
 
-  const dayLabel = (d: Date) =>
-    d.toLocaleDateString("en-GB", {
-      weekday: "short",
-      day: "2-digit",
-      month: "short",
-    });
-
-  const dominantShift = (drivers: Driver[]): "morning" | "evening" | "off" => {
-    const counts: Record<"morning" | "evening" | "off", number> = {
-      morning: 0,
-      evening: 0,
-      off: 0,
-    };
-
-    drivers.forEach((driver) => {
-      weekDates.forEach((d) => {
-        const row = grid[driver.id]?.[fmt(d)];
-        if (row) counts[row.shift_code] += 1;
+        if (pa.bucket !== pb.bucket) return pa.bucket - pb.bucket;
+        if (pa.label !== pb.label) return pa.label.localeCompare(pb.label);
+        return a.name.localeCompare(b.name);
       });
-    });
+    }
 
-    return (Object.entries(counts).sort((a, b) => b[1] - a[1])[0]?.[0] ??
-      "off") as "morning" | "evening" | "off";
-  };
+    unassigned.sort((a, b) => a.name.localeCompare(b.name));
 
-  const openOverride = (
-    driver: Driver,
-    date: Date,
-    current: "morning" | "evening" | "off"
-  ) => {
-    setOverrideModal({
-      driver_id: driver.id,
-      driver_name: driver.name,
-      shift_date: fmt(date),
-      current,
-    });
-    setOverrideCode(current);
-    setOverrideReason("");
-  };
+    return { byTeam: grouped, noTeam: unassigned };
+  }, [allDrivers, weekDates, grid]);
 
+  // ── Actions ───────────────────────────────────────────────
   const generate = async () => {
     setGenSaving(true);
     setError(null);
@@ -364,13 +429,11 @@ export default function ScheduleManager() {
       return;
     }
 
-    const result = (data ?? {}) as GenerateResult;
+    const d = (data ?? {}) as GenerateResult;
     setGenResult(
-      `✓ ${result.shifts_created ?? 0} shifts across ${
-        result.teams_processed ?? 0
-      } teams · ${
-        result.department_assignments?.assignments_created ?? 0
-      } department assignments`
+      `✓ ${d.shifts_created ?? 0} shifts across ${d.teams_processed ?? 0} teams · ${
+        d.department_assignments?.assignments_created ?? 0
+      } deployments`
     );
 
     await load();
@@ -401,8 +464,104 @@ export default function ScheduleManager() {
     await load();
   };
 
+  const applyRouteSwap = async () => {
+    if (!routeModal || !selectedRouteId) return;
+
+    setRouteSaving(true);
+    setError(null);
+
+    const { error: err } = await supabase.rpc("override_evening_route", {
+      p_driver_id: routeModal.driver_id,
+      p_shift_date: routeModal.shift_date,
+      p_route_id: selectedRouteId,
+      p_reason: routeReason || null,
+    });
+
+    setRouteSaving(false);
+
+    if (err) {
+      setError(err.message);
+      return;
+    }
+
+    setRouteModal(null);
+    setSelectedRouteId("");
+    setRouteReason("");
+    await load();
+  };
+
+  const openOverride = (
+    driver: Driver,
+    date: Date,
+    current: "morning" | "evening" | "off"
+  ) => {
+    setOverrideModal({
+      driver_id: driver.id,
+      driver_name: driver.name,
+      shift_date: fmt(date),
+      current,
+    });
+    setOverrideCode(current);
+    setOverrideReason("");
+  };
+
+  const openRouteSwap = (row: CalRow) => {
+    setRouteModal({
+      driver_id: row.driver_id,
+      driver_name: row.driver_name,
+      shift_date: row.shift_date,
+      current_route_id: row.evening_route_id,
+      current_route_name: row.evening_route_name,
+    });
+    setSelectedRouteId(row.evening_route_id ?? "");
+    setRouteReason("");
+  };
+
+  // ── Display helpers ───────────────────────────────────────
+  const dayLabel = (d: Date) =>
+    d.toLocaleDateString("en-GB", {
+      weekday: "short",
+      day: "2-digit",
+      month: "short",
+    });
+
+  function dominantShift(drivers: Driver[]): "morning" | "evening" | "off" {
+    const counts: Record<"morning" | "evening" | "off", number> = {
+      morning: 0,
+      evening: 0,
+      off: 0,
+    };
+
+    drivers.forEach((d) =>
+      weekDates.forEach((wd) => {
+        const code = grid[d.id]?.[fmt(wd)]?.shift_code;
+        if (code) counts[code] += 1;
+      })
+    );
+
+    return (Object.entries(counts).sort((a, b) => b[1] - a[1])[0]?.[0] ??
+      "off") as "morning" | "evening" | "off";
+  }
+
+  const deploymentLegend = useMemo(() => {
+    const names = new Set<string>();
+
+    rows.forEach((r) => {
+      if (r.shift_code === "morning" && r.department_name) names.add(r.department_name);
+    });
+
+    return [...names].sort((a, b) => {
+      const oa = DEPLOYMENT_SORT_ORDER[a] ?? 99;
+      const ob = DEPLOYMENT_SORT_ORDER[b] ?? 99;
+      if (oa !== ob) return oa - ob;
+      return a.localeCompare(b);
+    });
+  }, [rows]);
+
+  // ── Shared table ──────────────────────────────────────────
   const renderDriverTable = (drivers: Driver[]) => (
     <>
+      {/* Desktop */}
       <div className="desk-only" style={{ overflowX: "auto" }}>
         <table style={{ width: "100%", borderCollapse: "collapse" }}>
           <thead>
@@ -423,6 +582,7 @@ export default function ScheduleManager() {
               >
                 Driver
               </th>
+
               {weekDates.map((d) => (
                 <th
                   key={fmt(d)}
@@ -433,7 +593,7 @@ export default function ScheduleManager() {
                     fontWeight: 700,
                     textTransform: "uppercase",
                     letterSpacing: "0.04em",
-                    minWidth: 90,
+                    minWidth: 92,
                     color: fmt(d) === today ? "var(--accent)" : "var(--text-muted)",
                     background:
                       fmt(d) === today
@@ -491,15 +651,26 @@ export default function ScheduleManager() {
                           fmt(d) === today
                             ? "color-mix(in srgb, var(--accent-dim) 12%, transparent)"
                             : undefined,
+                        verticalAlign: "top",
                       }}
                     >
                       {row ? (
-                        <ShiftCell
-                          shift_code={row.shift_code}
-                          department_name={row.department_name}
-                          is_override={row.is_override}
-                          onClick={() => openOverride(driver, d, row.shift_code)}
-                        />
+                        <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                          <ShiftCell
+                            row={row}
+                            onClick={() => openOverride(driver, d, row.shift_code)}
+                          />
+
+                          {row.shift_code === "evening" && (
+                            <button
+                              className="btn btn-ghost btn-sm"
+                              style={{ fontSize: 10, padding: "2px 6px" }}
+                              onClick={() => openRouteSwap(row)}
+                            >
+                              Swap Route
+                            </button>
+                          )}
+                        </div>
                       ) : (
                         <EmptyCell onClick={() => openOverride(driver, d, "off")} />
                       )}
@@ -512,6 +683,7 @@ export default function ScheduleManager() {
         </table>
       </div>
 
+      {/* Mobile */}
       <div className="mob-only">
         {drivers.map((driver) => (
           <div
@@ -567,12 +739,21 @@ export default function ScheduleManager() {
                     </div>
 
                     {row ? (
-                      <ShiftCell
-                        shift_code={row.shift_code}
-                        department_name={row.department_name}
-                        is_override={row.is_override}
-                        onClick={() => openOverride(driver, d, row.shift_code)}
-                      />
+                      <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                        <ShiftCell
+                          row={row}
+                          onClick={() => openOverride(driver, d, row.shift_code)}
+                        />
+                        {row.shift_code === "evening" && (
+                          <button
+                            className="btn btn-ghost btn-sm"
+                            style={{ fontSize: 9, padding: "2px 4px" }}
+                            onClick={() => openRouteSwap(row)}
+                          >
+                            Route
+                          </button>
+                        )}
+                      </div>
                     ) : (
                       <EmptyCell onClick={() => openOverride(driver, d, "off")} />
                     )}
@@ -586,8 +767,10 @@ export default function ScheduleManager() {
     </>
   );
 
+  // ── Render ────────────────────────────────────────────────
   return (
     <div style={{ paddingBottom: 48 }}>
+      {/* Header */}
       <div
         style={{
           display: "flex",
@@ -617,6 +800,7 @@ export default function ScheduleManager() {
         </button>
       </div>
 
+      {/* Error */}
       {error && (
         <div className="alert alert-error" style={{ marginBottom: 16 }}>
           <span style={{ flex: 1 }}>{error}</span>
@@ -635,6 +819,7 @@ export default function ScheduleManager() {
         </div>
       )}
 
+      {/* Controls */}
       <div
         style={{
           display: "flex",
@@ -712,6 +897,7 @@ export default function ScheduleManager() {
         </div>
       </div>
 
+      {/* Legends */}
       <div
         style={{
           display: "flex",
@@ -750,31 +936,35 @@ export default function ScheduleManager() {
           }}
         />
 
-        {Object.entries(DEPT_COLORS).map(([k, v]) => (
-          <span
-            key={k}
-            style={{
-              display: "inline-flex",
-              alignItems: "center",
-              gap: 4,
-              padding: "3px 10px",
-              borderRadius: 20,
-              fontSize: 11,
-              fontWeight: 600,
-              background: v.bg,
-              color: v.text,
-              border: `1px solid ${v.text}`,
-            }}
-          >
-            {k}
-          </span>
-        ))}
+        {deploymentLegend.map((name) => {
+          const c = getDeploymentColors(name)!;
+          return (
+            <span
+              key={name}
+              style={{
+                display: "inline-flex",
+                alignItems: "center",
+                gap: 4,
+                padding: "3px 10px",
+                borderRadius: 20,
+                fontSize: 11,
+                fontWeight: 600,
+                background: c.bg,
+                color: c.text,
+                border: `1px solid ${c.text}`,
+              }}
+            >
+              {name}
+            </span>
+          );
+        })}
 
         <span style={{ fontSize: 10, color: "var(--text-dim)", marginLeft: 4 }}>
-          🟡 dot = manual override · Morning departments stay fixed for each 4-day block
+          Morning cells show unit/division deployment · Evening cells show route
         </span>
       </div>
 
+      {/* Calendar body */}
       {loading ? (
         <div style={{ display: "flex", justifyContent: "center", padding: 56 }}>
           <div className="spinner" />
@@ -897,7 +1087,7 @@ export default function ScheduleManager() {
                   ⚠️ No Team Assigned
                 </span>
                 <span style={{ fontSize: 12, color: "var(--text-dim)" }}>
-                  {noTeam.length} driver{noTeam.length !== 1 ? "s" : ""} — assign them to a team for automatic scheduling
+                  {noTeam.length} driver{noTeam.length !== 1 ? "s" : ""}
                 </span>
               </div>
 
@@ -907,6 +1097,7 @@ export default function ScheduleManager() {
         </div>
       )}
 
+      {/* Generate modal */}
       {showGen && (
         <div
           style={{
@@ -927,7 +1118,7 @@ export default function ScheduleManager() {
               background: "var(--surface)",
               borderRadius: 20,
               width: "100%",
-              maxWidth: 480,
+              maxWidth: 500,
               boxShadow: "var(--shadow-lg)",
               overflow: "hidden",
             }}
@@ -953,7 +1144,7 @@ export default function ScheduleManager() {
                     marginTop: 3,
                   }}
                 >
-                  Team-based 12-day cycle + block-based department rotation
+                  Team-based cycle + deployment grouping + route visibility
                 </div>
               </div>
 
@@ -1021,17 +1212,17 @@ export default function ScheduleManager() {
                     marginBottom: 8,
                   }}
                 >
-                  Department quota per morning team
+                  Morning deployment quota
                 </div>
 
                 <div style={{ display: "flex", flexWrap: "wrap", gap: 5 }}>
                   {[
-                    ["Joy News", "3 drivers"],
-                    ["Adom News", "2 drivers"],
-                    ["Joy Business", "1 driver"],
+                    ["Joy News", "3"],
+                    ["Adom News", "2"],
+                    ["Joy Business", "1"],
                     ["Production", "rest"],
                   ].map(([name, count]) => {
-                    const c = DEPT_COLORS[name as keyof typeof DEPT_COLORS];
+                    const c = getDeploymentColors(name)!;
                     return (
                       <span
                         key={name}
@@ -1058,8 +1249,8 @@ export default function ScheduleManager() {
                     lineHeight: 1.6,
                   }}
                 >
-                  Each driver keeps the same department for the full 4-day morning block, and
-                  should not repeat their immediate previous morning-block department when avoidable.
+                  Morning deployments may include units and divisions where applicable.
+                  Evening rows will show assigned route names.
                 </div>
               </div>
 
@@ -1096,6 +1287,7 @@ export default function ScheduleManager() {
         </div>
       )}
 
+      {/* Shift override modal */}
       {overrideModal && (
         <div
           style={{
@@ -1136,13 +1328,7 @@ export default function ScheduleManager() {
                 <div style={{ fontWeight: 700, fontSize: 15, color: "var(--text)" }}>
                   Override Shift
                 </div>
-                <div
-                  style={{
-                    fontSize: 12,
-                    color: "var(--text-muted)",
-                    marginTop: 3,
-                  }}
-                >
+                <div style={{ fontSize: 12, color: "var(--text-muted)", marginTop: 3 }}>
                   {overrideModal.driver_name} · {overrideModal.shift_date}
                 </div>
               </div>
@@ -1166,6 +1352,7 @@ export default function ScheduleManager() {
             <div style={{ padding: 20, display: "flex", flexDirection: "column", gap: 14 }}>
               <div>
                 <label className="form-label">New Shift</label>
+
                 <div style={{ display: "flex", gap: 8 }}>
                   {SHIFT_CODES.map((code) => {
                     const s = SHIFT_STYLE[code];
@@ -1233,6 +1420,96 @@ export default function ScheduleManager() {
                 disabled={overrideSaving}
               >
                 {overrideSaving ? "Saving…" : "Apply Override"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Route swap modal */}
+      {routeModal && (
+        <div
+          style={{
+            position: "fixed",
+            inset: 0,
+            zIndex: 50,
+            background: "rgba(0,0,0,0.5)",
+            backdropFilter: "blur(4px)",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            padding: 16,
+          }}
+          onClick={() => setRouteModal(null)}
+        >
+          <div
+            style={{
+              background: "var(--surface)",
+              borderRadius: 20,
+              width: "100%",
+              maxWidth: 420,
+              boxShadow: "var(--shadow-lg)",
+              overflow: "hidden",
+            }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div style={{ padding: "16px 20px", borderBottom: "1px solid var(--border)" }}>
+              <div style={{ fontWeight: 700, fontSize: 15, color: "var(--text)" }}>
+                Temporary Route Swap
+              </div>
+              <div style={{ fontSize: 12, color: "var(--text-muted)", marginTop: 3 }}>
+                {routeModal.driver_name} · {routeModal.shift_date}
+              </div>
+            </div>
+
+            <div style={{ padding: 20, display: "flex", flexDirection: "column", gap: 14 }}>
+              <div>
+                <label className="form-label">Evening Route</label>
+                <select
+                  className="tms-select"
+                  value={selectedRouteId}
+                  onChange={(e) => setSelectedRouteId(e.target.value)}
+                >
+                  <option value="">Select route</option>
+                  {routes.map((r) => (
+                    <option key={r.id} value={r.id}>
+                      {r.name}
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              <div>
+                <label className="form-label">
+                  Reason <span style={{ textTransform: "none", fontWeight: 400 }}>(optional)</span>
+                </label>
+                <input
+                  className="tms-input"
+                  value={routeReason}
+                  onChange={(e) => setRouteReason(e.target.value)}
+                  placeholder="e.g. temporary swap"
+                />
+              </div>
+            </div>
+
+            <div
+              style={{
+                padding: "12px 20px",
+                borderTop: "1px solid var(--border)",
+                display: "flex",
+                justifyContent: "flex-end",
+                gap: 10,
+              }}
+            >
+              <button className="btn btn-ghost" onClick={() => setRouteModal(null)}>
+                Cancel
+              </button>
+              <button
+                className="btn btn-primary"
+                onClick={applyRouteSwap}
+                disabled={routeSaving || !selectedRouteId}
+              >
+                {routeSaving ? "Saving…" : "Apply Route Swap"}
               </button>
             </div>
           </div>
