@@ -1,279 +1,391 @@
 // src/modules/reports/pages/ReportsDashboard.tsx
-// Wires kpi_snapshots as a fallback/trend source.
-// kpi_snapshots: { id, snapshot_date, metrics (jsonb), created_at }
-import { useEffect, useState } from "react";
+import { useEffect, useState, useCallback } from "react";
 import { supabase } from "@/lib/supabase";
-import { PageSpinner, Card, CardHeader, StatCard, Badge } from "@/components/TmsUI";
+import { PageSpinner, Card, CardHeader, CardBody, StatCard, Btn, Badge } from "@/components/TmsUI";
 import { fmtMoney } from "@/lib/utils";
 
-type StatusCount  = { status: string; total: number };
-type DailyCount   = { trip_date: string; total: number };
-type FuelMonthly  = { month: string; requests: number; total_liters: number; total_amount: number };
-type MaintMonthly = { month: string; requests: number; closed_count: number };
-type UtilRow      = { vehicle_id: string; plate_number: string; trips: number };
-type KpiSnapshot  = { id: string; snapshot_date: string; metrics: Record<string, number> };
+// ── Types ────────────────────────────────────────────────────────────────────
+type Period = "week" | "month" | "quarter" | "year";
+type KPI = {
+  total_bookings: number; approved_bookings: number; rejected_bookings: number;
+  completed_bookings: number; total_fuel_requests: number; total_fuel_amount: number;
+  total_fuel_liters: number; total_maintenance: number; active_vehicles: number;
+  active_drivers: number;
+};
+type BookingRow   = { status: string; booking_type: string; trip_date: string; purpose: string; created_at: string };
+type FuelRow      = { status: string; amount: number | null; liters: number | null; vendor: string | null; request_date: string; vehicles: { plate_number: string; fuel_type: string | null } | null };
+type MaintRow     = { status: string; issue_type: string | null; created_at: string; vehicles: { plate_number: string } | null };
+type VehicleUtil  = { plate_number: string; trip_count: number; total_km: number | null };
 
+// ── Period helpers ───────────────────────────────────────────────────────────
+function getPeriodRange(period: Period): { from: string; to: string; label: string } {
+  const now = new Date();
+  let from = new Date(), to = new Date();
+
+  if (period === "week") {
+    const dow = now.getDay();
+    from = new Date(now); from.setDate(now.getDate() - dow); from.setHours(0,0,0,0);
+    to = new Date(from); to.setDate(from.getDate() + 6); to.setHours(23,59,59,999);
+  } else if (period === "month") {
+    from = new Date(now.getFullYear(), now.getMonth(), 1);
+    to   = new Date(now.getFullYear(), now.getMonth() + 1, 0, 23, 59, 59);
+  } else if (period === "quarter") {
+    const q = Math.floor(now.getMonth() / 3);
+    from = new Date(now.getFullYear(), q * 3, 1);
+    to   = new Date(now.getFullYear(), q * 3 + 3, 0, 23, 59, 59);
+  } else {
+    from = new Date(now.getFullYear(), 0, 1);
+    to   = new Date(now.getFullYear(), 11, 31, 23, 59, 59);
+  }
+
+  const fmt = (d: Date) => d.toISOString().slice(0, 10);
+  const monthNames = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+
+  const labels: Record<Period, string> = {
+    week:    `Week of ${monthNames[from.getMonth()]} ${from.getDate()}`,
+    month:   `${monthNames[from.getMonth()]} ${from.getFullYear()}`,
+    quarter: `Q${Math.floor(from.getMonth()/3)+1} ${from.getFullYear()}`,
+    year:    `${from.getFullYear()}`,
+  };
+  return { from: fmt(from), to: fmt(to), label: labels[period] };
+}
+
+// ── Excel export (pure CSV approach, works universally) ─────────────────────
+function exportToCSV(period: Period, kpi: KPI, bookings: BookingRow[], fuel: FuelRow[], maint: MaintRow[]) {
+  const { label } = getPeriodRange(period);
+  const rows: string[][] = [];
+  rows.push([`TMS Report — ${label}`, "", "", ""]);
+  rows.push([]);
+  rows.push(["SUMMARY", ""]);
+  rows.push(["Total Bookings",     String(kpi.total_bookings)]);
+  rows.push(["Completed Trips",    String(kpi.completed_bookings)]);
+  rows.push(["Approved Bookings",  String(kpi.approved_bookings)]);
+  rows.push(["Rejected Bookings",  String(kpi.rejected_bookings)]);
+  rows.push(["Fuel Requests",      String(kpi.total_fuel_requests)]);
+  rows.push(["Fuel Amount (GHS)",  String(kpi.total_fuel_amount ?? 0)]);
+  rows.push(["Fuel Liters",        String(kpi.total_fuel_liters ?? 0)]);
+  rows.push(["Maintenance Issues", String(kpi.total_maintenance)]);
+  rows.push([]);
+  rows.push(["BOOKINGS", "Purpose", "Type", "Status", "Date"]);
+  for (const b of bookings) {
+    rows.push(["", b.purpose ?? "—", b.booking_type ?? "—", b.status, b.trip_date]);
+  }
+  rows.push([]);
+  rows.push(["FUEL REQUESTS", "Vehicle", "Fuel Type", "Liters", "Amount", "Vendor", "Date"]);
+  for (const f of fuel) {
+    rows.push([
+      "", f.vehicles?.plate_number ?? "—", f.vehicles?.fuel_type ?? "—",
+      String(f.liters ?? "—"), String(f.amount ?? "—"), f.vendor ?? "—", f.request_date,
+    ]);
+  }
+  rows.push([]);
+  rows.push(["MAINTENANCE", "Vehicle", "Issue Type", "Status", "Date"]);
+  for (const m of maint) {
+    rows.push(["", m.vehicles?.plate_number ?? "—", m.issue_type ?? "—", m.status, m.created_at.slice(0,10)]);
+  }
+
+  const csv = rows.map(r => r.map(c => `"${String(c).replace(/"/g,'""')}"`).join(",")).join("\n");
+  const blob = new Blob([csv], { type: "text/csv" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url; a.download = `TMS_Report_${label.replace(/\s+/g,"_")}.csv`;
+  a.click(); URL.revokeObjectURL(url);
+}
+
+// ── Simple bar component ─────────────────────────────────────────────────────
+function Bar({ label, value, max, color }: { label: string; value: number; max: number; color: string }) {
+  const pct = max > 0 ? Math.round((value / max) * 100) : 0;
+  return (
+    <div className="space-y-1">
+      <div className="flex justify-between text-xs" style={{ color: "var(--text-muted)" }}>
+        <span>{label}</span><span className="font-semibold" style={{ color: "var(--text)" }}>{value}</span>
+      </div>
+      <div className="w-full h-2 rounded-full" style={{ background: "var(--surface-2)" }}>
+        <div className="h-2 rounded-full transition-all" style={{ width: `${pct}%`, background: color }} />
+      </div>
+    </div>
+  );
+}
+
+// ── Donut component ──────────────────────────────────────────────────────────
+function DonutChart({ data }: { data: { label: string; value: number; color: string }[] }) {
+  const total = data.reduce((s, d) => s + d.value, 0);
+  if (total === 0) return <div className="text-xs text-center py-4" style={{ color: "var(--text-dim)" }}>No data</div>;
+  let offset = 0;
+  const radius = 40; const circ = 2 * Math.PI * radius;
+  return (
+    <div className="flex flex-col sm:flex-row items-center gap-4">
+      <svg viewBox="0 0 100 100" className="w-28 h-28 shrink-0">
+        {data.filter(d => d.value > 0).map((d, i) => {
+          const pct = d.value / total;
+          const dash = pct * circ;
+          const seg = (
+            <circle key={i} cx="50" cy="50" r={radius} fill="none" stroke={d.color} strokeWidth="18"
+              strokeDasharray={`${dash} ${circ - dash}`} strokeDashoffset={-offset}
+              transform="rotate(-90 50 50)" />
+          );
+          offset += dash;
+          return seg;
+        })}
+        <text x="50" y="54" textAnchor="middle" fontSize="14" fontWeight="bold" fill="var(--text)">{total}</text>
+      </svg>
+      <div className="space-y-1.5">
+        {data.map((d, i) => (
+          <div key={i} className="flex items-center gap-2">
+            <div className="w-3 h-3 rounded-sm shrink-0" style={{ background: d.color }} />
+            <span className="text-xs" style={{ color: "var(--text-muted)" }}>{d.label}</span>
+            <span className="text-xs font-semibold ml-auto pl-4" style={{ color: "var(--text)" }}>{d.value}</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ── Main component ───────────────────────────────────────────────────────────
 export default function ReportsDashboard() {
-  const [kpis,         setKpis]         = useState<Record<string, number> | null>(null);
-  const [statusCounts, setStatusCounts] = useState<StatusCount[]>([]);
-  const [dailyCounts,  setDailyCounts]  = useState<DailyCount[]>([]);
-  const [fuelMonthly,  setFuelMonthly]  = useState<FuelMonthly[]>([]);
-  const [maintMonthly, setMaintMonthly] = useState<MaintMonthly[]>([]);
-  const [util,         setUtil]         = useState<UtilRow[]>([]);
-  const [snapshots,    setSnapshots]    = useState<KpiSnapshot[]>([]);
-  const [loading,      setLoading]      = useState(true);
+  const [period, setPeriod] = useState<Period>("month");
+  const [loading, setLoading] = useState(true);
+  const [kpi, setKpi] = useState<KPI | null>(null);
+  const [bookings, setBookings] = useState<BookingRow[]>([]);
+  const [fuel, setFuel] = useState<FuelRow[]>([]);
+  const [maint, setMaint] = useState<MaintRow[]>([]);
+  const [utilization, setUtilization] = useState<VehicleUtil[]>([]);
 
-  useEffect(() => {
-    (async () => {
-      const [
-        { data: k },
-        { data: s },
-        { data: d },
-        { data: f },
-        { data: m },
-        { data: u },
-        { data: snaps },
-      ] = await Promise.all([
-        supabase.rpc("report_kpis"),
-        supabase.from("v_booking_status_counts").select("*"),
-        supabase.from("v_booking_daily_counts").select("*"),
-        supabase.from("v_fuel_monthly_totals").select("*"),
-        supabase.from("v_maintenance_monthly_totals").select("*"),
-        supabase.from("v_vehicle_utilization_30d").select("*"),
-        supabase
-          .from("kpi_snapshots")
-          .select("id,snapshot_date,metrics")
-          .order("snapshot_date", { ascending: false })
-          .limit(30),
-      ]);
+  const load = useCallback(async () => {
+    setLoading(true);
+    const { from, to } = getPeriodRange(period);
 
-      // report_kpis may return an array with one object
-      const kpiObj = Array.isArray(k) ? k[0] : k;
-      setKpis(kpiObj ?? null);
+    const [{ data: b }, { data: f }, { data: m }, { data: v }] = await Promise.all([
+      supabase.from("bookings").select("status,booking_type,trip_date,purpose,created_at")
+        .gte("created_at", from).lte("created_at", to + "T23:59:59").limit(1000),
+      supabase.from("fuel_requests").select("status,amount,liters,vendor,request_date,vehicles(plate_number,fuel_type)")
+        .gte("created_at", from).lte("created_at", to + "T23:59:59").limit(1000),
+      supabase.from("maintenance_requests").select("status,issue_type,created_at,vehicles(plate_number)")
+        .gte("created_at", from).lte("created_at", to + "T23:59:59").limit(1000),
+      supabase.from("v_vehicle_utilization_30d").select("*").limit(50),
+    ]);
 
-      setStatusCounts((s as any) || []);
-      setDailyCounts((d as any) || []);
-      setFuelMonthly((f as any) || []);
-      setMaintMonthly((m as any) || []);
-      setUtil((u as any) || []);
-      setSnapshots(((snaps as any) || []).reverse()); // oldest first for chart
-      setLoading(false);
-    })();
-  }, []);
+    const bRows = (b as BookingRow[]) || [];
+    const fRows = (f as unknown as FuelRow[]) || [];
+    const mRows = (m as unknown as MaintRow[]) || [];
+    const vRows = (v as unknown as VehicleUtil[]) || [];
+
+    setBookings(bRows); setFuel(fRows); setMaint(mRows); setUtilization(vRows);
+
+    setKpi({
+      total_bookings:     bRows.length,
+      approved_bookings:  bRows.filter(r => ["approved","dispatched","in_progress","completed","closed"].includes(r.status)).length,
+      rejected_bookings:  bRows.filter(r => r.status === "rejected").length,
+      completed_bookings: bRows.filter(r => ["completed","closed"].includes(r.status)).length,
+      total_fuel_requests: fRows.length,
+      total_fuel_amount:   fRows.reduce((s, r) => s + (r.amount ?? 0), 0),
+      total_fuel_liters:   fRows.reduce((s, r) => s + (r.liters ?? 0), 0),
+      total_maintenance:   mRows.length,
+      active_vehicles:     vRows.length,
+      active_drivers:      0,
+    });
+
+    setLoading(false);
+  }, [period]);
+
+  useEffect(() => { load(); }, [load]);
+
+  const { label } = getPeriodRange(period);
+
+  // Booking status distribution
+  const bookingStatusData = [
+    { label: "Completed", value: kpi?.completed_bookings ?? 0, color: "var(--green)" },
+    { label: "Approved",  value: bookings.filter(b => b.status === "approved").length, color: "var(--accent)" },
+    { label: "Rejected",  value: kpi?.rejected_bookings ?? 0, color: "var(--red)" },
+    { label: "Pending",   value: bookings.filter(b => ["draft","submitted"].includes(b.status)).length, color: "var(--amber)" },
+  ];
+
+  // Booking type breakdown
+  const typeCount: Record<string, number> = {};
+  for (const b of bookings) typeCount[b.booking_type] = (typeCount[b.booking_type] ?? 0) + 1;
+  const maxType = Math.max(...Object.values(typeCount), 1);
+
+  // Maintenance by status
+  const maintStatusData = [
+    { label: "Reported",    value: maint.filter(m => m.status === "reported").length,    color: "var(--amber)" },
+    { label: "In Progress", value: maint.filter(m => m.status === "in_progress").length, color: "var(--accent)" },
+    { label: "Completed",   value: maint.filter(m => ["completed","closed"].includes(m.status)).length, color: "var(--green)" },
+  ];
+
+  const periods: { value: Period; label: string }[] = [
+    { value: "week",    label: "This Week"    },
+    { value: "month",   label: "This Month"   },
+    { value: "quarter", label: "This Quarter" },
+    { value: "year",    label: "This Year"    },
+  ];
 
   if (loading) return <PageSpinner />;
 
-  // ── KPI config ─────────────────────────────────────────────────────────────
-  const KPI_CONFIG = kpis ? [
-    { label: "Bookings (30d)",          value: kpis.bookings_30d,            accent: "accent"  as const, icon: "📋" },
-    { label: "Pending Approvals",       value: kpis.pending_approvals,       accent: "amber"   as const, icon: "⏳" },
-    { label: "Approved (not dispatched)", value: kpis.approved_not_dispatched, accent: "purple" as const, icon: "✅" },
-    { label: "Active Trips",            value: kpis.active_trips,            accent: "green"   as const, icon: "🚗" },
-    { label: "Fuel Submitted",          value: kpis.fuel_submitted,          accent: "amber"   as const, icon: "⛽" },
-    { label: "Maintenance Open",        value: kpis.maintenance_open,        accent: "red"     as const, icon: "🔧" },
-  ] : [];
-
-  // ── Snapshot trend for a given metric ──────────────────────────────────────
-  function SnapshotSparkline({ metric, label }: { metric: string; label: string }) {
-    const pts = snapshots.filter(s => s.metrics?.[metric] != null);
-    if (pts.length < 2) return null;
-    const vals   = pts.map(s => s.metrics[metric]);
-    const maxVal = Math.max(...vals, 1);
-    const W = 200, H = 40;
-    const polyline = vals.map((v, i) => {
-      const x = (i / (vals.length - 1)) * W;
-      const y = H - (v / maxVal) * H;
-      return `${x},${y}`;
-    }).join(" ");
-    const latest = vals[vals.length - 1];
-    const prev   = vals[vals.length - 2];
-    const trend  = latest > prev ? "↑" : latest < prev ? "↓" : "→";
-    const trendColor = latest > prev ? "var(--green)" : latest < prev ? "var(--red)" : "var(--text-muted)";
-
-    return (
-      <div className="flex items-center gap-3">
-        <div className="flex-1">
-          <p className="text-xs font-medium mb-1" style={{ color: "var(--text-muted)" }}>{label}</p>
-          <svg viewBox={`0 0 ${W} ${H + 2}`} style={{ width: "100%", height: 36 }} preserveAspectRatio="none">
-            <polyline points={polyline} fill="none" stroke="var(--accent)"
-              strokeWidth="1.5" strokeLinejoin="round" strokeLinecap="round" />
-          </svg>
-        </div>
-        <div className="text-right shrink-0">
-          <div className="text-lg font-bold" style={{ color: "var(--text)" }}>{latest}</div>
-          <div className="text-xs font-semibold" style={{ color: trendColor }}>{trend}</div>
-        </div>
-      </div>
-    );
-  }
-
-  function Empty() {
-    return (
-      <div className="px-5 py-8 text-center text-sm" style={{ color: "var(--text-muted)" }}>
-        No data yet
-      </div>
-    );
-  }
-
-  // ── Sparkline from daily booking counts ────────────────────────────────────
-  const sparkMax = Math.max(...dailyCounts.map(d => d.total), 1);
-  const sparkW = 300, sparkH = 52;
-  const pts = dailyCounts.slice(-30);
-  const polyline = pts.map((d, i) => {
-    const x = (i / Math.max(pts.length - 1, 1)) * sparkW;
-    const y = sparkH - (d.total / sparkMax) * sparkH;
-    return `${x},${y}`;
-  }).join(" ");
-
   return (
-    <div className="space-y-4">
-      {/* KPI grid */}
-      {kpis && (
-        <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
-          {KPI_CONFIG.map(c => (
-            <StatCard key={c.label} label={c.label} value={c.value ?? "—"} accent={c.accent} />
-          ))}
+    <div className="space-y-5">
+      {/* Header with period selector + export */}
+      <div className="flex flex-col sm:flex-row sm:items-center gap-3 justify-between">
+        <div>
+          <h1 className="page-title">Reports</h1>
+          <p className="text-sm" style={{ color: "var(--text-muted)" }}>{label}</p>
         </div>
-      )}
-
-      {/* Booking sparkline */}
-      {pts.length > 1 && (
-        <Card>
-          <CardHeader title="Bookings — Last 30 Days" />
-          <div className="px-4 py-3 overflow-x-auto">
-            <svg width="100%" viewBox={`0 0 ${sparkW} ${sparkH + 8}`}
-              preserveAspectRatio="none" style={{ height: 60 }}>
-              <defs>
-                <linearGradient id="sparkGrad" x1="0" y1="0" x2="0" y2="1">
-                  <stop offset="0%"   stopColor="var(--accent)" stopOpacity="0.15"/>
-                  <stop offset="100%" stopColor="var(--accent)" stopOpacity="0"/>
-                </linearGradient>
-              </defs>
-              <polyline
-                points={[...pts.map((d, i) => {
-                  const x = (i / Math.max(pts.length - 1, 1)) * sparkW;
-                  const y = sparkH - (d.total / sparkMax) * sparkH;
-                  return `${x},${y}`;
-                }), `${sparkW},${sparkH + 8}`, `0,${sparkH + 8}`].join(" ")}
-                fill="url(#sparkGrad)"
-              />
-              <polyline
-                points={polyline}
-                fill="none"
-                stroke="var(--accent)"
-                strokeWidth="2"
-                strokeLinejoin="round"
-                strokeLinecap="round"
-              />
-            </svg>
-          </div>
-        </Card>
-      )}
-
-      {/* KPI Snapshot trends */}
-      {snapshots.length >= 2 && (
-        <Card>
-          <CardHeader
-            title="KPI Trends"
-            subtitle={`Based on ${snapshots.length} daily snapshots`}
-          />
-          <div className="px-5 py-4 grid grid-cols-1 sm:grid-cols-2 gap-5">
-            <SnapshotSparkline metric="bookings_30d"          label="Bookings (30d)" />
-            <SnapshotSparkline metric="active_trips"          label="Active Trips" />
-            <SnapshotSparkline metric="pending_approvals"     label="Pending Approvals" />
-            <SnapshotSparkline metric="maintenance_open"      label="Open Maintenance" />
-          </div>
-        </Card>
-      )}
-
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-        {/* Booking status */}
-        <Card>
-          <CardHeader title="Booking Status Breakdown" />
-          <div className="divide-y" style={{ borderColor: "var(--border)" }}>
-            {statusCounts.length === 0 ? (
-              <Empty />
-            ) : statusCounts.map(s => (
-              <div key={s.status} className="px-5 py-3 flex items-center justify-between gap-2">
-                <Badge status={s.status} />
-                <span className="text-sm font-semibold" style={{ color: "var(--text)" }}>{s.total}</span>
-              </div>
+        <div className="flex items-center gap-2">
+          <div className="flex rounded-xl overflow-hidden border" style={{ borderColor: "var(--border)" }}>
+            {periods.map(p => (
+              <button key={p.value} onClick={() => setPeriod(p.value)}
+                className="px-3 py-1.5 text-xs font-medium transition-colors"
+                style={{
+                  background: period === p.value ? "var(--accent)" : "var(--surface)",
+                  color: period === p.value ? "#fff" : "var(--text-muted)",
+                }}>
+                {p.label}
+              </button>
             ))}
           </div>
-        </Card>
+          <Btn variant="ghost" size="sm"
+            onClick={() => kpi && exportToCSV(period, kpi, bookings, fuel, maint)}>
+            ⬇ Export
+          </Btn>
+        </div>
+      </div>
 
-        {/* Vehicle utilisation */}
-        <Card>
-          <CardHeader title="Vehicle Utilisation (30d)" />
-          <div className="p-4 grid grid-cols-2 sm:grid-cols-3 gap-2">
-            {util.length === 0 ? (
-              <div className="col-span-full"><Empty /></div>
-            ) : util.map(r => (
-              <div key={r.vehicle_id}
-                className="rounded-xl p-3 text-center border"
-                style={{ background: "var(--surface-2)", borderColor: "var(--border)" }}>
-                <p className="text-sm font-bold" style={{ color: "var(--text)" }}>{r.plate_number}</p>
-                <p className="text-xl font-bold mt-0.5" style={{ color: "var(--accent)" }}>{r.trips}</p>
-                <p style={{ fontSize: 10, color: "var(--text-dim)" }}>trips</p>
-              </div>
-            ))}
-          </div>
-        </Card>
+      {/* KPI grid */}
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+        <StatCard label="Total Bookings"  value={kpi?.total_bookings ?? 0}    accent="accent" />
+        <StatCard label="Completed Trips" value={kpi?.completed_bookings ?? 0} accent="green" />
+        <StatCard label="Fuel Requests"   value={kpi?.total_fuel_requests ?? 0} accent="amber" />
+        <StatCard label="Maintenance"     value={kpi?.total_maintenance ?? 0}  accent="red" />
+      </div>
+      <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
+        <StatCard label="Fuel Spend" value={fmtMoney(kpi?.total_fuel_amount ?? 0)} accent="accent" />
+        <StatCard label="Liters Dispensed" value={`${(kpi?.total_fuel_liters ?? 0).toLocaleString()} L`} />
+        <StatCard label="Rejected Bookings" value={kpi?.rejected_bookings ?? 0} accent="red" />
+      </div>
 
-        {/* Fuel monthly */}
+      {/* Charts row */}
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
         <Card>
-          <CardHeader title="Fuel — Monthly Summary" />
-          <div className="divide-y" style={{ borderColor: "var(--border)" }}>
-            {fuelMonthly.length === 0 ? <Empty /> : fuelMonthly.slice(-6).map(r => (
-              <div key={r.month} className="px-5 py-3 flex items-center justify-between gap-2 text-sm">
-                <span style={{ color: "var(--text-muted)" }}>{r.month}</span>
-                <div className="flex gap-4 text-right">
-                  <div>
-                    <p style={{ fontSize: 10, color: "var(--text-muted)" }}>Requests</p>
-                    <p className="font-semibold" style={{ color: "var(--text)" }}>{r.requests}</p>
-                  </div>
-                  <div>
-                    <p style={{ fontSize: 10, color: "var(--text-muted)" }}>Litres</p>
-                    <p className="font-semibold" style={{ color: "var(--text)" }}>{r.total_liters ?? "—"}</p>
-                  </div>
-                  <div>
-                    <p style={{ fontSize: 10, color: "var(--text-muted)" }}>Cost</p>
-                    <p className="font-semibold" style={{ color: "var(--text)" }}>{fmtMoney(r.total_amount)}</p>
-                  </div>
-                </div>
-              </div>
-            ))}
-          </div>
+          <CardHeader title="Booking Status" />
+          <CardBody>
+            <DonutChart data={bookingStatusData} />
+          </CardBody>
         </Card>
-
-        {/* Maintenance monthly */}
         <Card>
-          <CardHeader title="Maintenance — Monthly" />
-          <div className="divide-y" style={{ borderColor: "var(--border)" }}>
-            {maintMonthly.length === 0 ? <Empty /> : maintMonthly.slice(-6).map(r => (
-              <div key={r.month} className="px-5 py-3 flex items-center justify-between gap-2 text-sm">
-                <span style={{ color: "var(--text-muted)" }}>{r.month}</span>
-                <div className="flex gap-4 text-right">
-                  <div>
-                    <p style={{ fontSize: 10, color: "var(--text-muted)" }}>Reported</p>
-                    <p className="font-semibold" style={{ color: "var(--text)" }}>{r.requests}</p>
-                  </div>
-                  <div>
-                    <p style={{ fontSize: 10, color: "var(--text-muted)" }}>Closed</p>
-                    <p className="font-semibold" style={{ color: "var(--green)" }}>{r.closed_count}</p>
-                  </div>
-                  <div>
-                    <p style={{ fontSize: 10, color: "var(--text-muted)" }}>Open</p>
-                    <p className="font-semibold" style={{ color: r.requests - r.closed_count > 0 ? "var(--amber)" : "var(--text-dim)" }}>
-                      {r.requests - r.closed_count}
-                    </p>
-                  </div>
-                </div>
-              </div>
-            ))}
-          </div>
+          <CardHeader title="Maintenance Status" />
+          <CardBody>
+            <DonutChart data={maintStatusData} />
+          </CardBody>
         </Card>
       </div>
+
+      {/* Booking type breakdown */}
+      {Object.keys(typeCount).length > 0 && (
+        <Card>
+          <CardHeader title="Bookings by Type" />
+          <CardBody className="space-y-3">
+            {Object.entries(typeCount).sort((a,b) => b[1]-a[1]).map(([type, count]) => (
+              <Bar key={type} label={type.charAt(0).toUpperCase() + type.slice(1)} value={count} max={maxType} color="var(--accent)" />
+            ))}
+          </CardBody>
+        </Card>
+      )}
+
+      {/* Fuel summary */}
+      {fuel.length > 0 && (
+        <Card>
+          <CardHeader title="Fuel Summary" />
+          <CardBody>
+            {/* By vehicle */}
+            {(() => {
+              const byVehicle: Record<string, { liters: number; amount: number }> = {};
+              for (const f of fuel) {
+                const plate = f.vehicles?.plate_number ?? "Unknown";
+                if (!byVehicle[plate]) byVehicle[plate] = { liters: 0, amount: 0 };
+                byVehicle[plate].liters += f.liters ?? 0;
+                byVehicle[plate].amount += f.amount ?? 0;
+              }
+              const maxL = Math.max(...Object.values(byVehicle).map(v => v.liters), 1);
+              return (
+                <div className="space-y-3">
+                  {Object.entries(byVehicle).sort((a,b) => b[1].amount - a[1].amount).map(([plate, v]) => (
+                    <div key={plate}>
+                      <div className="flex justify-between text-xs mb-1" style={{ color: "var(--text-muted)" }}>
+                        <span>{plate}</span>
+                        <span className="font-semibold" style={{ color: "var(--text)" }}>{v.liters.toFixed(1)}L · {fmtMoney(v.amount)}</span>
+                      </div>
+                      <div className="w-full h-2 rounded-full" style={{ background: "var(--surface-2)" }}>
+                        <div className="h-2 rounded-full" style={{ width: `${Math.round(v.liters/maxL*100)}%`, background: "var(--amber)" }} />
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              );
+            })()}
+          </CardBody>
+        </Card>
+      )}
+
+      {/* Vehicle utilization */}
+      {utilization.length > 0 && (
+        <Card>
+          <CardHeader title="Vehicle Utilization (30 days)" />
+          <CardBody>
+            <div className="overflow-x-auto">
+              <table className="tms-table">
+                <thead>
+                  <tr><th>Vehicle</th><th>Trips</th><th>Total KM</th></tr>
+                </thead>
+                <tbody>
+                  {utilization.sort((a,b) => b.trip_count - a.trip_count).map(v => (
+                    <tr key={v.plate_number}>
+                      <td className="font-medium">{v.plate_number}</td>
+                      <td>{v.trip_count}</td>
+                      <td>{v.total_km != null ? `${v.total_km.toLocaleString()} km` : "—"}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </CardBody>
+        </Card>
+      )}
+
+      {/* Maintenance detail */}
+      {maint.length > 0 && (
+        <Card>
+          <CardHeader title="Maintenance Issues" />
+          <CardBody>
+            <div className="sm:hidden space-y-2">
+              {maint.slice(0,20).map((m,i) => (
+                <div key={i} className="flex items-center justify-between gap-2 py-2 border-b last:border-0"
+                  style={{ borderColor: "var(--border)" }}>
+                  <div>
+                    <p className="text-sm font-medium" style={{ color: "var(--text)" }}>{m.vehicles?.plate_number ?? "—"}</p>
+                    <p className="text-xs capitalize" style={{ color: "var(--text-muted)" }}>{m.issue_type ?? "—"}</p>
+                  </div>
+                  <Badge status={m.status} />
+                </div>
+              ))}
+            </div>
+            <div className="hidden sm:block overflow-x-auto">
+              <table className="tms-table">
+                <thead><tr><th>Vehicle</th><th>Issue</th><th>Status</th><th>Date</th></tr></thead>
+                <tbody>
+                  {maint.slice(0,50).map((m,i) => (
+                    <tr key={i}>
+                      <td>{m.vehicles?.plate_number ?? "—"}</td>
+                      <td className="capitalize">{m.issue_type ?? "—"}</td>
+                      <td><Badge status={m.status} /></td>
+                      <td className="text-xs whitespace-nowrap" style={{ color: "var(--text-muted)" }}>{m.created_at.slice(0,10)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </CardBody>
+        </Card>
+      )}
     </div>
   );
 }

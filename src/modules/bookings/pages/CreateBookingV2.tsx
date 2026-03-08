@@ -9,28 +9,29 @@ type Profile = { division_id: string | null; unit_id: string | null };
 const BOOKING_TYPES = ["official", "production", "event", "news", "other"];
 
 export default function CreateBookingV2() {
-  const [profile, setProfile] = useState<Profile | null>(null);
-  const [units,   setUnits]   = useState<Unit[]>([]);
-  const [purpose, setPurpose] = useState("");
+  const [profile,       setProfile]       = useState<Profile | null>(null);
+  const [units,         setUnits]         = useState<Unit[]>([]);
+  const [purpose,       setPurpose]       = useState("");
   const [pickupLocation,  setPickupLocation]  = useState("");
   const [pickupDA,        setPickupDA]        = useState("");
   const [dropoffLocation, setDropoffLocation] = useState("");
   const [dropoffDA,       setDropoffDA]       = useState("");
-  const [tripDate, setTripDate]   = useState("");
-  const [tripTime, setTripTime]   = useState("");
-  const [bookingType, setBookingType] = useState("official");
+  const [tripDate,      setTripDate]      = useState("");
+  const [tripTime,      setTripTime]      = useState("");
+  const [bookingType,   setBookingType]   = useState("official");
   const [relatedUnitIds, setRelatedUnitIds] = useState<string[]>([]);
-  const [draftId,    setDraftId]   = useState<string | null>(null);
-  const [step,       setStep]      = useState<1 | 2>(1);
-  const [saving,     setSaving]    = useState(false);
-  const [submitted,  setSubmitted] = useState(false);
-  const [error,      setError]     = useState<string | null>(null);
+  const [draftId,       setDraftId]       = useState<string | null>(null);
+  const [step,          setStep]          = useState<1 | 2>(1);
+  const [saving,        setSaving]        = useState(false);
+  const [submitted,     setSubmitted]     = useState(false);
+  const [error,         setError]         = useState<string | null>(null);
 
   useEffect(() => {
     (async () => {
       const { data: u } = await supabase.auth.getUser();
       if (!u.user?.id) return;
-      const { data: p } = await supabase.from("profiles").select("division_id,unit_id").eq("user_id", u.user.id).single();
+      const { data: p } = await supabase.from("profiles")
+        .select("division_id,unit_id").eq("user_id", u.user.id).single();
       setProfile(p as Profile);
       const { data: un } = await supabase.from("units").select("id,name,division_id,parent_unit_id").order("name");
       setUnits((un as Unit[]) || []);
@@ -39,7 +40,7 @@ export default function CreateBookingV2() {
 
   const myDivisionUnits = useMemo(() => {
     if (!profile?.division_id) return [];
-    return units.filter(u => u.division_id === profile.division_id);
+    return units.filter(u => u.division_id === profile!.division_id);
   }, [units, profile?.division_id]);
 
   const toggleUnit = (id: string) =>
@@ -52,23 +53,48 @@ export default function CreateBookingV2() {
     }
     setSaving(true); setError(null);
     try {
-      const payload = {
-        purpose: purpose.trim(),
-        pickup_location: pickupLocation.trim(),
-        pickup_district_area: pickupDA.trim() || null,
-        dropoff_location: dropoffLocation.trim(),
-        dropoff_district_area: dropoffDA.trim() || null,
-        trip_date: tripDate,
-        trip_time: tripTime,
-        booking_type: bookingType,
-        related_unit_ids: relatedUnitIds.length ? relatedUnitIds : null,
+      const { data: { user } } = await supabase.auth.getUser();
+      if (!user) throw new Error("Not authenticated");
+
+      // Always fetch fresh profile to get division_id/unit_id
+      const { data: prof } = await supabase.from("profiles")
+        .select("division_id,unit_id").eq("user_id", user.id).single();
+
+      const payload: Record<string, unknown> = {
+        created_by:        user.id,
+        division_id:       (prof as Profile | null)?.division_id ?? null,
+        unit_id:           (prof as Profile | null)?.unit_id ?? null,
+        purpose:           purpose.trim(),
+        pickup_location:   pickupLocation.trim(),
+        dropoff_location:  dropoffLocation.trim(),
+        trip_date:         tripDate,
+        trip_time:         tripTime,
+        booking_type:      bookingType,
+        status:            "draft",
       };
-      if (draftId) {
-        await supabase.from("bookings").update(payload).eq("id", draftId);
+      if (pickupDA.trim())  payload.pickup_digital_address  = pickupDA.trim();
+      if (dropoffDA.trim()) payload.dropoff_digital_address = dropoffDA.trim();
+
+      let id = draftId;
+      if (id) {
+        const { error: updErr } = await supabase.from("bookings").update(payload).eq("id", id);
+        if (updErr) throw updErr;
       } else {
-        const { data } = await supabase.from("bookings").insert(payload).select("id").single();
-        setDraftId((data as any)?.id ?? null);
+        const { data: ins, error: insErr } = await supabase.from("bookings").insert(payload).select("id").single();
+        if (insErr) throw insErr;
+        id = (ins as any)?.id ?? null;
+        setDraftId(id);
       }
+
+      // Handle related units visibility
+      if (id && relatedUnitIds.length > 0) {
+        // Remove old then insert new
+        await supabase.from("booking_visibility_units").delete().eq("booking_id", id);
+        await supabase.from("booking_visibility_units").insert(
+          relatedUnitIds.map(uid => ({ booking_id: id, unit_id: uid }))
+        );
+      }
+
       setStep(2);
     } catch (e: any) {
       setError(e.message ?? "Failed to save.");
@@ -76,10 +102,11 @@ export default function CreateBookingV2() {
   };
 
   const submit = async () => {
-    if (!draftId) return;
+    if (!draftId) { setError("No draft found. Please go back and save first."); return; }
     setSaving(true); setError(null);
     try {
-      await supabase.rpc("submit_booking", { p_booking_id: draftId });
+      const { error: rpcErr } = await supabase.rpc("submit_booking", { p_booking_id: draftId });
+      if (rpcErr) throw rpcErr;
       setSubmitted(true);
     } catch (e: any) {
       setError(e.message ?? "Failed to submit.");
@@ -95,13 +122,14 @@ export default function CreateBookingV2() {
   if (submitted) {
     return (
       <div className="flex flex-col items-center justify-center py-16 text-center px-4">
-        <div className="w-14 h-14 rounded-full bg-[color:var(--green)]/15 flex items-center justify-center mb-4">
-          <svg className="w-7 h-7 text-[color:var(--green)]" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+        <div className="w-14 h-14 rounded-full flex items-center justify-center mb-4"
+          style={{ background: "var(--green-dim)" }}>
+          <svg className="w-7 h-7" style={{ color: "var(--green)" }} fill="none" viewBox="0 0 24 24" stroke="currentColor">
             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7"/>
           </svg>
         </div>
-        <h2 className="text-lg font-bold text-[color:var(--text)] mb-1">Booking Submitted</h2>
-        <p className="text-sm text-[color:var(--text-muted)] mb-6 max-w-xs">Your request has been sent for approval.</p>
+        <h2 className="text-lg font-bold" style={{ color: "var(--text)" }}>Booking Submitted</h2>
+        <p className="text-sm mt-1 mb-6" style={{ color: "var(--text-muted)" }}>Your request has been sent for approval.</p>
         <Btn variant="ghost" onClick={reset}>New Booking</Btn>
       </div>
     );
@@ -113,14 +141,17 @@ export default function CreateBookingV2() {
       <div className="flex items-center gap-2">
         {[1, 2].map(s => (
           <div key={s} className="flex items-center gap-2">
-            <div className={`w-6 h-6 rounded-full flex items-center justify-center text-xs font-bold transition-colors
-              ${step >= s ? "bg-[color:var(--accent)] text-white" : "bg-[color:var(--surface-2)] text-[color:var(--text-muted)]"}`}>
+            <div className="w-6 h-6 rounded-full flex items-center justify-center text-xs font-bold transition-colors"
+              style={{
+                background: step >= s ? "var(--accent)" : "var(--surface-2)",
+                color: step >= s ? "#fff" : "var(--text-muted)",
+              }}>
               {s}
             </div>
-            <span className={`text-xs font-medium ${step >= s ? "text-[color:var(--text)]" : "text-[color:var(--text-muted)]"}`}>
+            <span className="text-xs font-medium" style={{ color: step >= s ? "var(--text)" : "var(--text-muted)" }}>
               {s === 1 ? "Details" : "Review"}
             </span>
-            {s < 2 && <div className="w-8 h-px bg-[color:var(--border)] mx-1"/>}
+            {s < 2 && <div className="w-8 h-px mx-1" style={{ background: "var(--border)" }} />}
           </div>
         ))}
       </div>
@@ -171,15 +202,13 @@ export default function CreateBookingV2() {
                 <div className="grid grid-cols-2 gap-2">
                   {myDivisionUnits.map(u => (
                     <button
-                      key={u.id}
-                      type="button"
-                      onClick={() => toggleUnit(u.id)}
-                      className={`px-3 py-2 rounded-xl text-xs font-medium text-left transition-all border
-                        ${relatedUnitIds.includes(u.id)
-                          ? "bg-[color:var(--accent-dim)] border-[color:var(--accent)] text-[color:var(--accent)]"
-                          : "bg-[color:var(--surface-2)] border-[color:var(--border)] text-[color:var(--text-muted)] hover:border-[color:var(--border-bright)]"
-                        }`}
-                    >
+                      key={u.id} type="button" onClick={() => toggleUnit(u.id)}
+                      className="px-3 py-2 rounded-xl text-xs font-medium text-left transition-all border"
+                      style={{
+                        background: relatedUnitIds.includes(u.id) ? "var(--accent-dim)" : "var(--surface-2)",
+                        borderColor: relatedUnitIds.includes(u.id) ? "var(--accent)" : "var(--border)",
+                        color: relatedUnitIds.includes(u.id) ? "var(--accent)" : "var(--text-muted)",
+                      }}>
                       {u.name}
                     </button>
                   ))}
@@ -208,9 +237,10 @@ export default function CreateBookingV2() {
               ["Dropoff",    dropoffLocation + (dropoffDA ? `, ${dropoffDA}` : "")],
               ["Shared with", relatedUnitIds.length ? `${relatedUnitIds.length} unit(s)` : "—"],
             ].map(([label, value]) => (
-              <div key={label} className="flex items-start gap-3 py-2 border-b border-[color:var(--border)] last:border-0">
-                <span className="text-xs text-[color:var(--text-muted)] w-24 shrink-0 pt-0.5">{label}</span>
-                <span className="text-sm text-[color:var(--text)] font-medium capitalize">{value}</span>
+              <div key={label} className="flex items-start gap-3 py-2 border-b last:border-0"
+                style={{ borderColor: "var(--border)" }}>
+                <span className="text-xs w-24 shrink-0 pt-0.5" style={{ color: "var(--text-muted)" }}>{label}</span>
+                <span className="text-sm font-medium capitalize" style={{ color: "var(--text)" }}>{value}</span>
               </div>
             ))}
             <div className="pt-3">
