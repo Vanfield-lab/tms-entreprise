@@ -1,49 +1,61 @@
 // src/modules/fuel/pages/FuelReviewQueue.tsx
-// Corporate Approver: review submitted fuel requests → approve or reject
-// Flow: submitted (here) → approved → FuelRecordQueue (Transport records it)
 import { useEffect, useState } from "react";
 import { supabase } from "@/lib/supabase";
-import { approveFuelRequest } from "../services/fuel.service";
-import {
-  PageSpinner, EmptyState, Badge, Card, CountPill,
-  Field, Input, Btn,
-} from "@/components/TmsUI";
-import { fmtDate, fmtMoney } from "@/lib/utils";
+import { PageSpinner, EmptyState, Badge, Card, CountPill, Field, Input, Btn } from "@/components/TmsUI";
+import { fmtDate } from "@/lib/utils";
+
+type FuelRow = {
+  id: string;
+  status: string;
+  purpose: string | null;
+  notes: string | null;
+  request_date: string;
+  created_at: string;
+  vehicles: { plate_number: string; fuel_type: string | null } | null;
+  profiles: { full_name: string } | null; // via created_by
+};
 
 export default function FuelReviewQueue() {
-  const [rows,    setRows]    = useState<any[]>([]);
-  const [notes,   setNotes]   = useState<Record<string, string>>({});
+  const [rows,    setRows]    = useState<FuelRow[]>([]);
+  const [comment, setComment] = useState<Record<string, string>>({});
   const [acting,  setActing]  = useState<Record<string, boolean>>({});
   const [loading, setLoading] = useState(true);
 
   const load = async () => {
     setLoading(true);
-    const { data } = await supabase
+    const { data, error } = await supabase
       .from("fuel_requests")
-      .select("*")
+      .select("id,status,purpose,notes,request_date,created_at,vehicles(plate_number,fuel_type),profiles!created_by(full_name)")
       .eq("status", "submitted")
       .order("created_at", { ascending: false })
       .limit(200);
-    setRows(data ?? []);
+
+    if (error) console.error("FuelReviewQueue load:", error.message);
+    setRows((data as unknown as FuelRow[]) || []);
     setLoading(false);
   };
 
   useEffect(() => {
     load();
-
-    // Realtime — update queue when new requests come in
     const ch = supabase
-      .channel("fuel_review_queue")
-      .on("postgres_changes", { event: "*", schema: "public", table: "fuel_requests" }, () => load())
+      .channel("fuel_review_realtime")
+      .on("postgres_changes", { event: "*", schema: "public", table: "fuel_requests" }, load)
       .subscribe();
     return () => { supabase.removeChannel(ch); };
   }, []);
 
-  const act = async (id: string, approve: boolean) => {
+  const act = async (id: string, action: "approved" | "rejected") => {
     setActing(m => ({ ...m, [id]: true }));
     try {
-      await approveFuelRequest(id, "approved", notes[id]);
+      const { error } = await supabase.rpc("approve_fuel_request", {
+        p_fuel_request_id: id,
+        p_action:  action,
+        p_comment: comment[id] ?? null,
+      });
+      if (error) throw error;
       await load();
+    } catch (e: any) {
+      alert("Action failed: " + e.message);
     } finally {
       setActing(m => ({ ...m, [id]: false }));
     }
@@ -53,98 +65,111 @@ export default function FuelReviewQueue() {
 
   return (
     <div className="space-y-4">
-      {/* Mobile page header */}
       <div className="page-header">
         <div>
           <h1 className="page-title">Fuel Approvals</h1>
-          <p className="page-sub">Review and approve fuel requests from staff and drivers</p>
+          <p className="text-sm" style={{ color: "var(--text-muted)" }}>Review and approve fuel requests</p>
         </div>
       </div>
 
-      {/* Flow indicator */}
-      <div className="flex items-center gap-2 text-xs text-[color:var(--text-muted)] bg-[color:var(--surface-2)] border border-[color:var(--border)] rounded-xl px-4 py-2.5 w-fit flex-wrap">
-        <span className="badge badge-draft">Draft</span>
-        <span>→</span>
-        <span className="badge badge-submitted font-bold ring-2 ring-[color:var(--amber)]">Submitted ← you are here</span>
-        <span>→</span>
-        <span className="badge badge-approved">Approved</span>
-        <span>→</span>
-        <span className="badge badge-recorded">Recorded (Transport)</span>
-      </div>
-
       {rows.length === 0 ? (
-        <EmptyState
-          title="No pending fuel approvals"
-          subtitle="When staff or drivers submit a fuel request it will appear here for your review. Make sure they click 'Submit Request' — draft requests don't appear in this queue."
-        />
+        <EmptyState title="All caught up" subtitle="No fuel requests awaiting approval" />
       ) : (
         <>
           <div className="flex items-center gap-2">
             <CountPill n={rows.length} color="amber" />
-            <span className="text-sm text-[color:var(--text-muted)]">
+            <span className="text-sm" style={{ color: "var(--text-muted)" }}>
               pending approval{rows.length !== 1 ? "s" : ""}
             </span>
           </div>
 
-          <div className="space-y-3">
+          <div className="space-y-4">
             {rows.map(r => (
               <Card key={r.id}>
-                {/* Card header */}
-                <div className="px-4 py-3 border-b border-[color:var(--border)] bg-[color:var(--amber)]/10">
-                  <div className="flex items-start justify-between gap-2">
+                {/* Header */}
+                <div
+                  className="px-4 py-3 border-b flex items-start justify-between gap-3"
+                  style={{
+                    borderColor: "var(--border)",
+                    background: "var(--amber-dim)",
+                  }}
+                >
+                  <div className="min-w-0">
+                    <p className="font-bold text-sm" style={{ color: "var(--text)" }}>
+                      {r.purpose || "Fuel Request"}
+                    </p>
+                    <p className="text-xs mt-0.5" style={{ color: "var(--text-muted)" }}>
+                      Submitted {fmtDate(r.created_at)}
+                    </p>
+                  </div>
+                  <Badge status={r.status} />
+                </div>
+
+                {/* Request details — what was actually submitted */}
+                <div className="px-4 py-4 space-y-3 border-b" style={{ borderColor: "var(--border)" }}>
+                  <div className="grid grid-cols-2 sm:grid-cols-3 gap-3 text-sm">
                     <div>
-                      <p className="font-semibold text-sm text-[color:var(--text)]">{r.purpose || "Fuel Request"}</p>
-                      <p className="text-xs text-[color:var(--text-muted)] mt-0.5">{fmtDate(r.created_at)}</p>
+                      <p className="text-xs" style={{ color: "var(--text-dim)" }}>Requested By</p>
+                      <p className="font-semibold mt-0.5" style={{ color: "var(--text)" }}>
+                        {r.profiles?.full_name ?? "—"}
+                      </p>
                     </div>
-                    <Badge status={r.status} />
+                    <div>
+                      <p className="text-xs" style={{ color: "var(--text-dim)" }}>Vehicle</p>
+                      <p className="font-semibold mt-0.5" style={{ color: "var(--text)" }}>
+                        {r.vehicles?.plate_number ?? "—"}
+                      </p>
+                    </div>
+                    <div>
+                      <p className="text-xs" style={{ color: "var(--text-dim)" }}>Fuel Type</p>
+                      <p className="font-semibold mt-0.5 capitalize" style={{ color: "var(--text)" }}>
+                        {r.vehicles?.fuel_type ?? "—"}
+                      </p>
+                    </div>
+                    <div>
+                      <p className="text-xs" style={{ color: "var(--text-dim)" }}>Date Requested</p>
+                      <p className="font-semibold mt-0.5" style={{ color: "var(--text)" }}>
+                        {fmtDate(r.request_date)}
+                      </p>
+                    </div>
                   </div>
+
+                  {r.notes && (
+                    <div
+                      className="rounded-lg px-3 py-2 text-sm"
+                      style={{ background: "var(--surface-2)", color: "var(--text-muted)" }}
+                    >
+                      <span className="font-medium" style={{ color: "var(--text)" }}>Notes: </span>
+                      {r.notes}
+                    </div>
+                  )}
                 </div>
 
-                {/* Stats grid */}
-                <div className="grid grid-cols-3 divide-x divide-[color:var(--border)] border-b border-[color:var(--border)]">
-                  {[
-                    ["Type",   r.fuel_type  ?? "—"],
-                    ["Litres", r.liters     ?? "—"],
-                    ["Est.",   r.estimated_cost ? fmtMoney(r.estimated_cost) : "—"],
-                  ].map(([label, value]) => (
-                    <div key={label} className="p-3 text-center">
-                      <p className="text-[10px] font-medium text-[color:var(--text-muted)] uppercase tracking-wider mb-1">{label}</p>
-                      <p className="text-sm font-semibold text-[color:var(--text)] capitalize">{value}</p>
-                    </div>
-                  ))}
-                </div>
-
-                {r.notes && (
-                  <div className="px-4 py-2 border-b border-[color:var(--border)]">
-                    <p className="text-xs text-[color:var(--text-muted)]">{r.notes}</p>
-                  </div>
-                )}
-
-                {/* Review actions */}
+                {/* Approve / Reject */}
                 <div className="p-4 space-y-3">
-                  <Field label="Review Note (optional)">
+                  <Field label="Comment (optional)">
                     <Input
-                      placeholder="Add a comment or reason…"
-                      value={notes[r.id] ?? ""}
-                      onChange={e => setNotes(m => ({ ...m, [r.id]: e.target.value }))}
+                      placeholder="Add a comment for the requester…"
+                      value={comment[r.id] || ""}
+                      onChange={e => setComment(m => ({ ...m, [r.id]: e.target.value }))}
                     />
                   </Field>
                   <div className="flex gap-2">
                     <Btn
-                      variant="success"
-                      size="sm"
+                      variant="primary"
+                      className="flex-1"
                       loading={acting[r.id]}
-                      onClick={() => act(r.id, true)}
+                      onClick={() => act(r.id, "approved")}
                     >
-                      ✓ Approve
+                      ✅ Approve
                     </Btn>
                     <Btn
                       variant="danger"
-                      size="sm"
+                      className="flex-1"
                       loading={acting[r.id]}
-                      onClick={() => act(r.id, false)}
+                      onClick={() => act(r.id, "rejected")}
                     >
-                      ✗ Reject
+                      ❌ Reject
                     </Btn>
                   </div>
                 </div>
