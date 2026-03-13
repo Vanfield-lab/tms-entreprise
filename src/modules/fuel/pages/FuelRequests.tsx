@@ -3,7 +3,22 @@
 import { useEffect, useState } from "react";
 import { supabase } from "@/lib/supabase";
 import { fmtDate, fmtMoney } from "@/lib/utils";
-import type { FuelRequest, FuelStatus } from "../services/fuel.service";
+
+type FuelStatus = "draft" | "submitted" | "approved" | "rejected" | "recorded";
+
+type FuelRequest = {
+  id: string;
+  vehicle_id: string | null;
+  driver_id: string | null;
+  purpose: string | null;
+  liters: number | null;
+  amount: number | null;
+  vendor: string | null;
+  notes: string | null;
+  status: FuelStatus;
+  request_date: string | null;
+  created_at: string;
+};
 
 const STATUS_BADGE: Record<FuelStatus, string> = {
   draft:     "badge badge-draft",
@@ -59,7 +74,7 @@ export default function FuelRequests() {
 
     setRows(raw.map(r => ({
       ...r,
-      plate_number: vMap[r.vehicle_id] ?? "—",
+      plate_number: r.vehicle_id ? (vMap[r.vehicle_id] ?? "—") : "—",
       driver_name:  r.driver_id ? dMap[r.driver_id] ?? "—" : "—",
     })));
     setLoading(false);
@@ -83,7 +98,6 @@ export default function FuelRequests() {
         <p className="page-sub">{rows.length} total request{rows.length !== 1 ? "s" : ""}</p>
       </div>
 
-      {/* Status filter */}
       <div className="flex gap-2 flex-wrap">
         {(["all", "draft", "submitted", "approved", "rejected", "recorded"] as const).map(s => (
           <button
@@ -121,7 +135,6 @@ export default function FuelRequests() {
         <div className="space-y-2">
           {filtered.map(r => (
             <div key={r.id} className="card" style={{ overflow: "hidden" }}>
-              {/* Header row */}
               <button
                 className="w-full text-left"
                 style={{ padding: "12px 16px", background: "none", border: "none", cursor: "pointer" }}
@@ -143,7 +156,6 @@ export default function FuelRequests() {
                 </div>
               </button>
 
-              {/* Expanded detail */}
               {expanded === r.id && (
                 <div style={{ borderTop: "1px solid var(--border)", padding: "12px 16px" }} className="space-y-2">
                   <div className="grid grid-cols-2 gap-2" style={{ fontSize: 13 }}>
